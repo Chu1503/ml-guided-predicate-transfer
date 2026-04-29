@@ -18,6 +18,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use datafusion::physical_optimizer::bloom_filter_transfer::MultiHopBloomFilterRule;
+
 use super::{
     IMDB_QUERY_END_ID, IMDB_QUERY_START_ID, IMDB_TABLES, get_imdb_table_schema,
     get_query_sql,
@@ -313,7 +315,13 @@ impl RunOpt {
         config.options_mut().execution.hash_join_buffering_capacity =
             self.hash_join_buffering_capacity;
         let rt = self.common.build_runtime()?;
-        let ctx = SessionContext::new_with_config_rt(config, rt);
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_config(config.clone())
+            .with_runtime_env(rt.clone())
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(MultiHopBloomFilterRule::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
 
         // register tables
         self.register_tables(&ctx).await?;

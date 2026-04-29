@@ -42,8 +42,6 @@ use tokio::sync::broadcast;
 
 use crate::PhysicalOptimizerRule;
 
-// Shared Bloom Filter Handle
-
 #[derive(Debug, Clone)]
 pub struct BloomPayload {
     pub filter: Arc<Bloom<String>>,
@@ -51,11 +49,10 @@ pub struct BloomPayload {
     pub distinct_estimate: usize,
     pub filter_size_bytes: usize,
     pub build_time_ms: f64,
+    pub timed_out: bool,
 }
 
 type SharedBloom = Arc<broadcast::Sender<Arc<BloomPayload>>>;
-
-// Execution Metrics
 
 #[derive(Debug)]
 pub struct FilterMetrics {
@@ -109,7 +106,8 @@ impl FilterMetrics {
 }
 
 pub fn write_metrics(metrics: &FilterMetrics, path: &str) {
-    let write_header = !std::path::Path::new(path).exists() || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let write_header = !std::path::Path::new(path).exists()
+        || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -121,8 +119,6 @@ pub fn write_metrics(metrics: &FilterMetrics, path: &str) {
     write!(file, "{}", metrics.to_csv_row()).unwrap();
 }
 
-// Rule Struct
-
 #[derive(Default, Debug)]
 pub struct MultiHopBloomFilterRule {}
 
@@ -132,15 +128,11 @@ impl MultiHopBloomFilterRule {
     }
 }
 
-// JoinEdge
-
 #[derive(Debug, Clone)]
 pub struct JoinEdge {
     pub left_col: String,
     pub right_col: String,
 }
-
-// Join Graph Collection
 
 pub fn collect_join_edges(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinEdge> {
     let mut edges = Vec::new();
@@ -163,8 +155,6 @@ fn collect_recursive(plan: &Arc<dyn ExecutionPlan>, edges: &mut Vec<JoinEdge>) {
         collect_recursive(child, edges);
     }
 }
-
-// BloomFilterBuildExec
 
 #[derive(Debug)]
 pub struct BloomFilterBuildExec {
@@ -242,54 +232,83 @@ impl ExecutionPlan for BloomFilterBuildExec {
 
         let output_stream = async_stream::stream! {
             let build_start = Instant::now();
+            let timeout_ms: u64 = std::env::var("BF_BUILD_TIMEOUT_MS")
+                .unwrap_or_else(|_| "2000".to_string())
+                .parse()
+                .unwrap_or(2000);
+            let timeout_dur = std::time::Duration::from_millis(timeout_ms);
+
             let mut all_values: Vec<String> = Vec::new();
             let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut timed_out = false;
 
-            while let Some(batch_result) = input_stream.next().await {
-                let batch: RecordBatch = match batch_result {
-                    Ok(b) => b,
-                    Err(e) => { yield Err(e); return; }
-                };
-
-                let col = batch.column(key_column);
-                if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+            loop {
+                match tokio::time::timeout(timeout_dur, input_stream.next()).await {
+                    Err(_) => {
+                        timed_out = true;
+                        println!(
+                            "[BloomFilterBuildExec] col='{}' timed out after {}ms",
+                            key_column_name, timeout_ms
+                        );
+                        break;
                     }
-                } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
-                    }
-                } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                    Ok(None) => break,
+                    Ok(Some(Err(e))) => { yield Err(e); return; }
+                    Ok(Some(Ok(batch))) => {
+                        let col = batch.column(key_column);
+                        if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                            }
+                        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                            }
+                        } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                            }
+                        }
+                        batches.push(batch);
                     }
                 }
-                batches.push(batch);
             }
 
-            let build_cardinality = all_values.len();
-            let distinct_estimate = {
-                let mut seen = std::collections::HashSet::new();
-                for v in &all_values { seen.insert(v.clone()); }
-                seen.len()
-            };
+            if timed_out {
+                let payload = BloomPayload {
+                    filter: Arc::new(Bloom::new_for_fp_rate(1, 0.9999).unwrap()),
+                    build_cardinality: 0,
+                    distinct_estimate: 0,
+                    filter_size_bytes: 0,
+                    build_time_ms: build_start.elapsed().as_secs_f64() * 1000.0,
+                    timed_out: true,
+                };
+                let _ = sender.send(Arc::new(payload));
+            } else {
+                let build_cardinality = all_values.len();
+                let distinct_estimate = {
+                    let mut seen = std::collections::HashSet::new();
+                    for v in &all_values { seen.insert(v.clone()); }
+                    seen.len()
+                };
 
-            let mut bf = Bloom::new_for_fp_rate(build_cardinality.max(1), 0.01).unwrap();
-            for v in &all_values {
-                bf.set(v);
+                let mut bf = Bloom::new_for_fp_rate(build_cardinality.max(1), 0.01).unwrap();
+                for v in &all_values {
+                    bf.set(v);
+                }
+                let filter_size_bytes = build_cardinality * 2;
+                let build_time_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+
+                let payload = BloomPayload {
+                    filter: Arc::new(bf),
+                    build_cardinality,
+                    distinct_estimate,
+                    filter_size_bytes,
+                    build_time_ms,
+                    timed_out: false,
+                };
+                let _ = sender.send(Arc::new(payload));
             }
-            let filter_size_bytes = build_cardinality * 2;
-            let build_time_ms = build_start.elapsed().as_secs_f64() * 1000.0;
-
-            let payload = BloomPayload {
-                filter: Arc::new(bf),
-                build_cardinality,
-                distinct_estimate,
-                filter_size_bytes,
-                build_time_ms,
-            };
-            let _ = sender.send(Arc::new(payload)); 
 
             for batch in batches {
                 yield Ok(batch);
@@ -306,8 +325,6 @@ impl ExecutionPlan for BloomFilterBuildExec {
         Ok(TreeNodeRecursion::Continue)
     }
 }
-
-// BloomFilterProbeExec
 
 #[derive(Debug)]
 pub struct BloomFilterProbeExec {
@@ -396,6 +413,16 @@ impl ExecutionPlan for BloomFilterProbeExec {
                     return;
                 }
             };
+
+            if payload.timed_out {
+                while let Some(batch_result) = input_stream.next().await {
+                    match batch_result {
+                        Ok(b) => yield Ok(b),
+                        Err(e) => yield Err(e),
+                    }
+                }
+                return;
+            }
 
             let probe_start = Instant::now();
             let mut probe_batches = 0usize;
@@ -489,8 +516,6 @@ impl ExecutionPlan for BloomFilterProbeExec {
     }
 }
 
-// Plan Rewriting
-
 fn insert_bloom_filters(
     plan: Arc<dyn ExecutionPlan>,
     edges: &[JoinEdge],
@@ -532,25 +557,32 @@ fn insert_bloom_filters(
                 if let (Some(left_field_name), Some(right_field_name)) =
                     (left_field_name, right_field_name)
                 {
-                    let (sender, _) = broadcast::channel(1);
-                    let sender = Arc::new(sender);
+                    let skip_build_cols = [  "movie_id", "person_id", ];
+                    let skip = skip_build_cols.iter().any(|c| left_field_name == *c);
 
-                    new_left = Arc::new(BloomFilterBuildExec::new(
-                        new_left,
-                        left_field_name.clone(),
-                        Arc::clone(&sender),
-                    ));
+                    if skip {
+                        println!("Skipped BF: Build col '{}' is a large fact table column", left_field_name);
+                    } else {
+                        let (sender, _) = broadcast::channel(1);
+                        let sender = Arc::new(sender);
 
-                    new_right = Arc::new(BloomFilterProbeExec::new(
-                        new_right,
-                        right_field_name.clone(),
-                        Arc::clone(&sender),
-                    ));
+                        new_left = Arc::new(BloomFilterBuildExec::new(
+                            new_left,
+                            left_field_name.clone(),
+                            Arc::clone(&sender),
+                        ));
 
-                    println!(
-                        "Inserted BF: Build On Col '{}', Probe On Col '{}'",
-                        left_field_name, right_field_name
-                    );
+                        new_right = Arc::new(BloomFilterProbeExec::new(
+                            new_right,
+                            right_field_name.clone(),
+                            Arc::clone(&sender),
+                        ));
+
+                        println!(
+                            "Inserted BF: Build On Col '{}', Probe On Col '{}'",
+                            left_field_name, right_field_name
+                        );
+                    }
                 }
             }
 
@@ -571,8 +603,6 @@ fn insert_bloom_filters(
 
     plan.with_new_children(new_children)
 }
-
-// Optimizer Rule Implementation
 
 impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
     fn optimize(
@@ -602,8 +632,6 @@ impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
         true
     }
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {
